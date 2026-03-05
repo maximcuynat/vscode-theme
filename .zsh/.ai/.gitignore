@@ -1,3 +1,6 @@
 # Logs
 logs/*
 .last_session
+
+# Connexions (clés API chiffrées — ne jamais commiter)
+.connections

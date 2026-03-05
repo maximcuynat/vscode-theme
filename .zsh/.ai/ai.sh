@@ -11,6 +11,14 @@ STATE_FILE="$AI_CLI_ROOT/.last_session"
 PROFILES_FILE="$AI_CLI_ROOT/.model_profiles"
 CONFIG_FILE="$AI_CLI_ROOT/.config"
 OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+CONNECTIONS_FILE="$AI_CLI_ROOT/.connections"
+
+# Mode de connexion : ollama (local) | external (serveur OpenAI-compatible)
+CONNECTION_MODE="ollama"
+ACTIVE_CONNECTION=""   # Nom du profil de connexion actif
+EXTERNAL_URL=""        # URL résolue depuis le profil actif (runtime uniquement)
+EXTERNAL_API_KEY=""    # Clé déchiffrée (runtime uniquement, jamais persitée)
+_MASTER_PASS=""        # Mot de passe maître (session uniquement, jamais écrit)
 
 SELECTED_MODEL=""
 SELECTED_AGENT=""
@@ -74,18 +82,23 @@ _badge() {
 _status_bar() {
   local model="${SELECTED_MODEL:-—}"
   local agent="${SELECTED_AGENT:-—}"
-  local ollama_status
-  if _ollama_running; then
-    ollama_status="${C_GREEN}● online${C_RESET}"
+  local conn_badge
+  if [[ "$CONNECTION_MODE" == "external" ]]; then
+    local conn_name="${ACTIVE_CONNECTION:-externe}"
+    conn_badge="${C_BLUE}🌐 ${conn_name}${C_RESET}"
   else
-    ollama_status="${C_RED}● offline${C_RESET}"
+    if _ollama_running; then
+      conn_badge="${C_GREEN}● Ollama online${C_RESET}"
+    else
+      conn_badge="${C_RED}● Ollama offline${C_RESET}"
+    fi
   fi
   echo
   _badge "MODEL" "$model" "$C_GREEN"
   printf "   "
   _badge "AGENT" "$agent" "$C_YELLOW"
   printf "   "
-  printf "  ${C_DIM}OLLAMA${C_RESET}  ${ollama_status}"
+  printf "  ${C_DIM}CONN${C_RESET}  ${conn_badge}"
   echo
   _line "─" "$C_GRAY"
 }
@@ -138,8 +151,10 @@ load_config() {
     key="${line%%=*}"
     val="${line#*=}"
     case "$key" in
-      CODE_EXTENSIONS) eval "CODE_EXTENSIONS=($val)" ;;
-      EXCLUDED_DIRS)   eval "EXCLUDED_DIRS=($val)" ;;
+      CODE_EXTENSIONS)  eval "CODE_EXTENSIONS=($val)" ;;
+      EXCLUDED_DIRS)    eval "EXCLUDED_DIRS=($val)" ;;
+      CONNECTION_MODE)  CONNECTION_MODE="$val" ;;
+      ACTIVE_CONNECTION) ACTIVE_CONNECTION="$val" ;;
     esac
   done < "$CONFIG_FILE"
 }
@@ -150,6 +165,8 @@ save_config() {
     echo "# AI-CLI config — extensions et dossiers exclus"
     echo "CODE_EXTENSIONS=${CODE_EXTENSIONS[*]}"
     echo "EXCLUDED_DIRS=${EXCLUDED_DIRS[*]}"
+    echo "CONNECTION_MODE=$CONNECTION_MODE"
+    echo "ACTIVE_CONNECTION=$ACTIVE_CONNECTION"
   } > "$CONFIG_FILE"
 }
 
@@ -224,6 +241,8 @@ _ollama_running() {
 }
 
 _require_ollama() {
+  # En mode externe, pas besoin d'Ollama
+  [[ "$CONNECTION_MODE" == "external" ]] && return 0
   _ollama_running && return 0
   _error "Ollama est hors ligne (${OLLAMA_HOST})"
   echo
@@ -368,12 +387,32 @@ manage_models() {
 
     # Recharge la liste à chaque tour
     installed=()
-    while IFS= read -r m; do
-      [[ -n "$m" ]] && installed+=("$m")
-    done < <(_ollama_list_models | sort)
+    if [[ "$CONNECTION_MODE" == "external" ]]; then
+      # Essaie de lister les modèles via /v1/models (OpenAI-compatible)
+      while IFS= read -r m; do
+        [[ -n "$m" ]] && installed+=("$m")
+      done < <(curl -sf -H "Authorization: Bearer ${EXTERNAL_API_KEY}" \
+        "${EXTERNAL_URL}/v1/models" 2>/dev/null \
+        | python3 -c "
+import sys, json
+try:
+  data = json.load(sys.stdin)
+  for m in data.get('data', []):
+    print(m.get('id',''))
+except: pass
+" 2>/dev/null | sort)
+    else
+      while IFS= read -r m; do
+        [[ -n "$m" ]] && installed+=("$m")
+      done < <(_ollama_list_models | sort)
+    fi
 
     if [[ ${#installed[@]} -eq 0 ]]; then
-      _warn "Aucun modèle installé localement."
+      if [[ "$CONNECTION_MODE" == "external" ]]; then
+        _warn "Impossible de lister les modèles — configure manuellement avec ${C_GRAY}m${C_RESET}"
+      else
+        _warn "Aucun modèle installé localement."
+      fi
     else
       printf "  ${C_DIM}Modèles installés :${C_RESET}\n\n"
       i=1
@@ -406,8 +445,12 @@ manage_models() {
     _line "╌" "$C_GRAY"
     printf "  ${C_GRAY}s${C_RESET}  Sélectionner un modèle ${C_DIM}(charge aussi son agent associé)${C_RESET}\n"
     printf "  ${C_GRAY}e${C_RESET}  Éditer le profil d'un modèle ${C_DIM}(label · usages · agent)${C_RESET}\n"
-    printf "  ${C_GRAY}a${C_RESET}  Ajouter un modèle ${C_DIM}(ollama pull)${C_RESET}\n"
-    printf "  ${C_GRAY}d${C_RESET}  Supprimer un modèle\n"
+    if [[ "$CONNECTION_MODE" == "external" ]]; then
+      printf "  ${C_GRAY}m${C_RESET}  Définir le modèle manuellement ${C_DIM}(nom exact du modèle distant)${C_RESET}\n"
+    else
+      printf "  ${C_GRAY}a${C_RESET}  Ajouter un modèle ${C_DIM}(ollama pull)${C_RESET}\n"
+      printf "  ${C_GRAY}d${C_RESET}  Supprimer un modèle\n"
+    fi
     printf "  ${C_GRAY}r${C_RESET}  Rafraîchir\n"
     printf "  ${C_GRAY}q${C_RESET}  Retour au menu\n"
     echo
@@ -456,6 +499,10 @@ manage_models() {
         ;;
 
       a|A)
+        if [[ "$CONNECTION_MODE" == "external" ]]; then
+          _warn "Pull non disponible en mode externe. Utilise ${C_GRAY}m${C_RESET} pour définir le modèle manuellement."
+          sleep 1.5; continue
+        fi
         echo
         _info "Exemples : llama3, gemma:7b, phi3, mistral, codellama"
         _prompt "Nom du modèle à télécharger :"
@@ -477,6 +524,10 @@ manage_models() {
         ;;
 
       d|D)
+        if [[ "$CONNECTION_MODE" == "external" ]]; then
+          _warn "Suppression non disponible en mode externe."
+          sleep 1.2; continue
+        fi
         if [[ ${#installed[@]} -eq 0 ]]; then
           _warn "Aucun modèle à supprimer."; sleep 1; continue
         fi
@@ -502,6 +553,19 @@ manage_models() {
           _info "Annulé."
         fi
         sleep 0.8
+        ;;
+
+      m|M)
+        # Saisie manuelle du modèle (mode externe ou fallback)
+        echo
+        _info "Entre le nom exact du modèle tel qu'il est exposé par le serveur distant."
+        _prompt "Nom du modèle :"
+        read -r new_model
+        [[ -z "$new_model" ]] && continue
+        SELECTED_MODEL="$new_model"
+        save_session_state
+        _ok "Modèle actif : ${C_GREEN}${SELECTED_MODEL}${C_RESET}"
+        sleep 1
         ;;
 
       r|R) continue ;;
@@ -809,28 +873,48 @@ log_entry() {
   printf "[%s] %s:\n%s\n\n" "$(date +"%Y-%m-%d %H:%M:%S")" "$1" "$2" >> "$LOG_FILE"
 }
 
-# ── Appel Ollama ──────────────────────────────────────────
+# ── Appel modèle (Ollama local ou serveur externe) ────────
 
 call_model_clean() {
-  # API REST Ollama — réponse JSON propre, zéro séquence ANSI
   local prompt="$1"
   local json_payload
-  json_payload=$(python3 -c "
+
+  if [[ "$CONNECTION_MODE" == "external" ]]; then
+    # API OpenAI-compatible (/v1/chat/completions)
+    json_payload=$(python3 -c "
+import sys, json
+print(json.dumps({'model': sys.argv[1], 'messages': [{'role': 'user', 'content': sys.argv[2]}], 'stream': False}))
+" "$SELECTED_MODEL" "$prompt" 2>/dev/null)
+
+    local curl_args=(-sf -X POST "${EXTERNAL_URL}/v1/chat/completions"
+      -H "Content-Type: application/json"
+      -d "$json_payload")
+    [[ -n "$EXTERNAL_API_KEY" ]] && curl_args+=(-H "Authorization: Bearer ${EXTERNAL_API_KEY}")
+
+    curl "${curl_args[@]}" \
+    | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+print(data['choices'][0]['message']['content'])
+" 2>/dev/null
+  else
+    # API Ollama locale (/api/generate)
+    json_payload=$(python3 -c "
 import sys, json
 print(json.dumps({'model': sys.argv[1], 'prompt': sys.argv[2], 'stream': False}))
 " "$SELECTED_MODEL" "$prompt" 2>/dev/null)
 
-  curl -sf \
-    -X POST "${OLLAMA_HOST}/api/generate" \
-    -H "Content-Type: application/json" \
-    -d "$json_payload" \
-  | python3 -c "
+    curl -sf \
+      -X POST "${OLLAMA_HOST}/api/generate" \
+      -H "Content-Type: application/json" \
+      -d "$json_payload" \
+    | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 print(data.get('response', ''))
 " 2>/dev/null
+  fi
 }
-
 
 
 # ── Contexte fichiers (@mention et @?recherche) ───────────────
@@ -1421,11 +1505,324 @@ edit_settings() {
   done
 }
 
+# ── Gestionnaire de connexions ────────────────────────────
+
+# Format .connections : nom|url|clé_chiffrée_base64
+# La clé est chiffrée avec openssl AES-256-CBC + mot de passe maître
+
+_conn_init() {
+  [[ -f "$CONNECTIONS_FILE" ]] || touch "$CONNECTIONS_FILE"
+  chmod 600 "$CONNECTIONS_FILE"
+}
+
+_get_master_pass() {
+  if [[ -z "$_MASTER_PASS" ]]; then
+    echo
+    _info "Mot de passe maître requis pour chiffrer/déchiffrer les clés API."
+    _info "${C_DIM}(non stocké sur disque, valable pour cette session uniquement)${C_RESET}"
+    printf "  ${C_MAGENTA}❯${C_RESET}  ${C_WHITE}Mot de passe maître :${C_RESET} "
+    read -rs _MASTER_PASS
+    echo
+    [[ -z "$_MASTER_PASS" ]] && _MASTER_PASS="__no_key__"
+  fi
+}
+
+_conn_encrypt() {
+  local plaintext="$1"
+  [[ -z "$plaintext" ]] && echo "" && return
+  _get_master_pass
+  echo "$plaintext" | openssl enc -aes-256-cbc -a -pbkdf2 -pass pass:"$_MASTER_PASS" 2>/dev/null | tr -d '\n'
+}
+
+_conn_decrypt() {
+  local encrypted="$1"
+  [[ -z "$encrypted" ]] && echo "" && return
+  _get_master_pass
+  echo "$encrypted" | openssl enc -d -aes-256-cbc -a -pbkdf2 -pass pass:"$_MASTER_PASS" 2>/dev/null
+}
+
+_conn_list() {
+  [[ -f "$CONNECTIONS_FILE" ]] || return
+  grep -v '^#' "$CONNECTIONS_FILE" | grep -v '^$' | cut -d'|' -f1
+}
+
+_conn_get() {
+  local name="$1" field="$2"
+  local line
+  line=$(grep "^${name}|" "$CONNECTIONS_FILE" 2>/dev/null | head -1)
+  [[ -z "$line" ]] && echo "" && return
+  case "$field" in
+    url)  echo "$line" | cut -d'|' -f2 ;;
+    key)  echo "$line" | cut -d'|' -f3 ;;
+  esac
+}
+
+_conn_set() {
+  local name="$1" url="$2" encrypted_key="$3"
+  _conn_init
+  local tmpfile; tmpfile=$(mktemp)
+  grep -v "^${name}|" "$CONNECTIONS_FILE" > "$tmpfile" 2>/dev/null || true
+  echo "${name}|${url}|${encrypted_key}" >> "$tmpfile"
+  mv "$tmpfile" "$CONNECTIONS_FILE"
+  chmod 600 "$CONNECTIONS_FILE"
+}
+
+_conn_delete() {
+  local name="$1"
+  local tmpfile; tmpfile=$(mktemp)
+  grep -v "^${name}|" "$CONNECTIONS_FILE" > "$tmpfile" 2>/dev/null || true
+  mv "$tmpfile" "$CONNECTIONS_FILE"
+}
+
+_conn_test() {
+  local url="$1" api_key="$2"
+  local auth_header=()
+  [[ -n "$api_key" ]] && auth_header=(-H "Authorization: Bearer ${api_key}")
+  if curl -sf --max-time 5 "${auth_header[@]}" "${url}/v1/models" > /dev/null 2>&1; then
+    return 0
+  fi
+  # Fallback : essai /health ou /api/tags (Ollama distant)
+  curl -sf --max-time 5 "${url}/api/tags" > /dev/null 2>&1
+}
+
+_conn_load_active() {
+  # Résout EXTERNAL_URL et EXTERNAL_API_KEY depuis ACTIVE_CONNECTION
+  [[ -z "$ACTIVE_CONNECTION" ]] && return 1
+  EXTERNAL_URL=$(_conn_get "$ACTIVE_CONNECTION" url)
+  local enc_key; enc_key=$(_conn_get "$ACTIVE_CONNECTION" key)
+  if [[ -n "$enc_key" ]]; then
+    EXTERNAL_API_KEY=$(_conn_decrypt "$enc_key")
+  else
+    EXTERNAL_API_KEY=""
+  fi
+  [[ -n "$EXTERNAL_URL" ]]
+}
+
+manage_connections() {
+  _conn_init
+  local action choice names=() n i
+
+  while true; do
+    _header
+    _status_bar
+    printf "  ${C_BOLD}${C_WHITE}Gestionnaire de connexions${C_RESET}\n\n"
+
+    # Mode actif
+    if [[ "$CONNECTION_MODE" == "external" ]]; then
+      printf "  ${C_DIM}Mode actif :${C_RESET}  ${C_BLUE}${C_BOLD}🌐 Serveur externe${C_RESET}"
+      [[ -n "$ACTIVE_CONNECTION" ]] && printf "  ${C_DIM}(${ACTIVE_CONNECTION})${C_RESET}"
+      echo
+    else
+      printf "  ${C_DIM}Mode actif :${C_RESET}  ${C_GREEN}${C_BOLD}● Ollama local${C_RESET}\n"
+    fi
+    echo
+
+    # Liste des profils
+    names=()
+    while IFS= read -r n; do
+      [[ -n "$n" ]] && names+=("$n")
+    done < <(_conn_list)
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+      printf "  ${C_GRAY}${C_DIM}Aucun profil externe configuré${C_RESET}\n\n"
+    else
+      printf "  ${C_DIM}Profils configurés :${C_RESET}\n\n"
+      i=1
+      for n in "${names[@]}"; do
+        local marker="  "
+        [[ "$n" == "$ACTIVE_CONNECTION" && "$CONNECTION_MODE" == "external" ]] && marker="${C_BLUE}✔${C_RESET} "
+        local conn_url; conn_url=$(_conn_get "$n" url)
+        local has_key; has_key=$(_conn_get "$n" key)
+        local key_badge="${C_GRAY}no key${C_RESET}"
+        [[ -n "$has_key" ]] && key_badge="${C_GREEN}🔑 chiffrée${C_RESET}"
+        printf "  ${C_GRAY}%2d${C_RESET}  %b${C_WHITE}%s${C_RESET}  ${C_DIM}%s${C_RESET}  %b\n" \
+          "$i" "$marker" "$n" "$conn_url" "$key_badge"
+        ((i++))
+      done
+      echo
+    fi
+
+    _line "╌" "$C_GRAY"
+    printf "  ${C_GRAY}o${C_RESET}  Basculer en ${C_GREEN}Ollama local${C_RESET}\n"
+    printf "  ${C_GRAY}x${C_RESET}  Basculer sur un profil externe\n"
+    printf "  ${C_GRAY}a${C_RESET}  Ajouter un profil de connexion\n"
+    printf "  ${C_GRAY}e${C_RESET}  Éditer un profil\n"
+    printf "  ${C_GRAY}t${C_RESET}  Tester la connexion active\n"
+    printf "  ${C_GRAY}d${C_RESET}  Supprimer un profil\n"
+    printf "  ${C_GRAY}p${C_RESET}  Changer le mot de passe maître ${C_DIM}(session)${C_RESET}\n"
+    printf "  ${C_GRAY}q${C_RESET}  Retour\n"
+    echo
+    _prompt "Action :"
+    read -r action || break
+
+    case "$action" in
+
+      o|O)
+        CONNECTION_MODE="ollama"
+        ACTIVE_CONNECTION=""
+        EXTERNAL_URL=""
+        EXTERNAL_API_KEY=""
+        save_config
+        _ok "Mode basculé sur ${C_GREEN}Ollama local${C_RESET}."
+        sleep 1
+        ;;
+
+      x|X)
+        if [[ ${#names[@]} -eq 0 ]]; then
+          _warn "Aucun profil disponible. Ajoute-en un avec ${C_GRAY}a${C_RESET} d'abord."
+          sleep 1.2; continue
+        fi
+        echo
+        _prompt "Numéro du profil à activer :"
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#names[@]}" ]]; then
+          ACTIVE_CONNECTION="${names[$choice]}"
+          CONNECTION_MODE="external"
+          if _conn_load_active; then
+            save_config
+            _ok "Connexion active : ${C_BLUE}${ACTIVE_CONNECTION}${C_RESET}  (${EXTERNAL_URL})"
+          else
+            _error "Impossible de charger le profil."
+          fi
+        else
+          _error "Choix invalide."
+        fi
+        sleep 1
+        ;;
+
+      a|A)
+        echo
+        _prompt "Nom du profil (ex: serveur-perso, openrouter) :"
+        read -r new_name
+        [[ -z "$new_name" ]] && continue
+        _prompt "URL du serveur (ex: http://192.168.1.10:1234) :"
+        read -r new_url
+        [[ -z "$new_url" ]] && continue
+        _prompt "Clé API (laisser vide si pas d'auth) :"
+        read -rs new_key
+        echo
+        local enc_key=""
+        if [[ -n "$new_key" ]]; then
+          enc_key=$(_conn_encrypt "$new_key")
+          if [[ -z "$enc_key" ]]; then
+            _error "Échec du chiffrement. Vérifie qu'openssl est installé."
+            sleep 1.5; continue
+          fi
+        fi
+        _conn_set "$new_name" "$new_url" "$enc_key"
+        _ok "Profil ${C_BLUE}${new_name}${C_RESET} enregistré."
+        sleep 1
+        ;;
+
+      e|E)
+        if [[ ${#names[@]} -eq 0 ]]; then
+          _warn "Aucun profil à éditer."; sleep 1; continue
+        fi
+        echo
+        _prompt "Numéro du profil à éditer :"
+        read -r choice
+        if ! [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#names[@]}" ]]; then
+          _error "Choix invalide."; sleep 0.8; continue
+        fi
+        local edit_name="${names[$choice]}"
+        local cur_url; cur_url=$(_conn_get "$edit_name" url)
+        echo
+        _info "URL actuelle : ${C_DIM}${cur_url}${C_RESET}"
+        _prompt "Nouvelle URL (Entrée pour garder) :"
+        read -r upd_url
+        [[ -z "$upd_url" ]] && upd_url="$cur_url"
+        _info "Clé API chiffrée : ${C_DIM}(saisir pour changer, Entrée pour garder)${C_RESET}"
+        printf "  ${C_MAGENTA}❯${C_RESET}  ${C_WHITE}Nouvelle clé API :${C_RESET} "
+        read -rs upd_key
+        echo
+        local upd_enc=""
+        if [[ -n "$upd_key" ]]; then
+          upd_enc=$(_conn_encrypt "$upd_key")
+        else
+          upd_enc=$(_conn_get "$edit_name" key)
+        fi
+        _conn_set "$edit_name" "$upd_url" "$upd_enc"
+        # Si ce profil est actif, recharger les credentials
+        if [[ "$ACTIVE_CONNECTION" == "$edit_name" && "$CONNECTION_MODE" == "external" ]]; then
+          _conn_load_active
+        fi
+        _ok "Profil ${C_BLUE}${edit_name}${C_RESET} mis à jour."
+        sleep 1
+        ;;
+
+      t|T)
+        if [[ "$CONNECTION_MODE" != "external" || -z "$ACTIVE_CONNECTION" ]]; then
+          _warn "Aucune connexion externe active."; sleep 1; continue
+        fi
+        if [[ -z "$EXTERNAL_URL" ]]; then _conn_load_active; fi
+        echo
+        _info "Test de ${C_BLUE}${EXTERNAL_URL}${C_RESET}…"
+        if _conn_test "$EXTERNAL_URL" "$EXTERNAL_API_KEY"; then
+          _ok "Connexion OK — le serveur répond."
+        else
+          _error "Serveur inaccessible ou clé API invalide."
+        fi
+        sleep 1.5
+        ;;
+
+      d|D)
+        if [[ ${#names[@]} -eq 0 ]]; then
+          _warn "Aucun profil à supprimer."; sleep 1; continue
+        fi
+        echo
+        _prompt "Numéro du profil à supprimer :"
+        read -r choice
+        if ! [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#names[@]}" ]]; then
+          _error "Choix invalide."; sleep 0.8; continue
+        fi
+        local del_name="${names[$choice]}"
+        _prompt "Confirmer la suppression de ${C_RED}${del_name}${C_RESET} ? (o/N) :"
+        read -r confirm
+        if [[ "$confirm" =~ ^[oO]$ ]]; then
+          _conn_delete "$del_name"
+          if [[ "$ACTIVE_CONNECTION" == "$del_name" ]]; then
+            CONNECTION_MODE="ollama"
+            ACTIVE_CONNECTION=""
+            EXTERNAL_URL=""
+            EXTERNAL_API_KEY=""
+            save_config
+            _warn "Profil actif supprimé — retour en mode Ollama local."
+          else
+            _ok "Profil ${del_name} supprimé."
+          fi
+        else
+          _info "Annulé."
+        fi
+        sleep 1
+        ;;
+
+      p|P)
+        echo
+        _info "Le nouveau mot de passe maître s'applique à cette session uniquement."
+        _warn "Les clés déjà chiffrées avec l'ancien mot de passe restent inchangées."
+        printf "  ${C_MAGENTA}❯${C_RESET}  ${C_WHITE}Nouveau mot de passe maître :${C_RESET} "
+        read -rs _MASTER_PASS
+        echo
+        [[ -z "$_MASTER_PASS" ]] && _MASTER_PASS="__no_key__"
+        _ok "Mot de passe maître mis à jour pour cette session."
+        sleep 1
+        ;;
+
+      q|Q) break ;;
+      *) _error "Action invalide."; sleep 0.5 ;;
+    esac
+  done
+}
+
 # ── Menu principal ────────────────────────────────────────
 
 main_menu() {
   load_session_state
   load_config
+  # Restaure la connexion externe active si configurée
+  if [[ "$CONNECTION_MODE" == "external" && -n "$ACTIVE_CONNECTION" ]]; then
+    _conn_load_active 2>/dev/null || true
+  fi
   PROJECT_DIR="$PWD"
   local choice menu_label
 
@@ -1454,6 +1851,7 @@ main_menu() {
     printf "  ${C_GRAY}5${C_RESET}  Éditer un agent ${C_DIM}(créer · modifier les prompts)${C_RESET}\n"
     printf "  ${C_GRAY}6${C_RESET}  Voir les logs\n"
     printf "  ${C_GRAY}7${C_RESET}  Paramètres ${C_DIM}(extensions · dossiers exclus)${C_RESET}\n"
+    printf "  ${C_GRAY}c${C_RESET}  Connexions ${C_DIM}(ollama local · serveur externe · profils chiffrés)${C_RESET}\n"
     printf "  ${C_GRAY}8${C_RESET}  ${C_RED}Quitter${C_RESET}\n"
 
     echo
@@ -1468,6 +1866,7 @@ main_menu() {
       5) edit_agent ;;
       6) show_logs ;;
       7) edit_settings ;;
+      c|C) manage_connections ;;
       8)
         clear
         printf "\n  ${C_DIM}À bientôt.${C_RESET}\n\n"
